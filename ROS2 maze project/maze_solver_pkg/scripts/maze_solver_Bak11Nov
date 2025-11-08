@@ -2,8 +2,7 @@
 
 """
 Maze Solver Node for ROS 2 Humble
-Combines SLAM, Nav2, and Frontier Exploration to solve unknown mazes
-FIXED: Proper goal state tracking to avoid premature cancellations
+STRONG OUTWARD BIAS: Heavily prioritizes exploring away from start
 """
 
 import rclpy
@@ -29,16 +28,26 @@ class MazeSolver(Node):
         self.declare_parameter('goal_tolerance', 0.15)
         self.declare_parameter('frontier_min_size', 5)
         self.declare_parameter('exploration_interval', 12.0)
-        self.declare_parameter('maze_exit_threshold', 3.0)
         self.declare_parameter('initial_rotation_time', 20.0)
         self.declare_parameter('min_frontier_distance', 0.5)
+        
+        # LIDAR-based exit detection parameters
+        self.declare_parameter('exit_detection_range', 2.5)
+        self.declare_parameter('exit_detection_angle', 120.0)
+        self.declare_parameter('exit_min_distance_from_start', 2.0)
+        self.declare_parameter('outward_exploration_weight', 10.0)
+        self.declare_parameter('min_frontier_distance_from_start', 0.3)
         
         self.goal_tolerance = self.get_parameter('goal_tolerance').value
         self.frontier_min_size = self.get_parameter('frontier_min_size').value
         self.exploration_interval = self.get_parameter('exploration_interval').value
-        self.exit_threshold = self.get_parameter('maze_exit_threshold').value
         self.initial_rotation_time = self.get_parameter('initial_rotation_time').value
         self.min_frontier_distance = self.get_parameter('min_frontier_distance').value
+        self.exit_detection_range = self.get_parameter('exit_detection_range').value
+        self.exit_detection_angle = self.get_parameter('exit_detection_angle').value
+        self.exit_min_distance_from_start = self.get_parameter('exit_min_distance_from_start').value
+        self.outward_weight = self.get_parameter('outward_exploration_weight').value
+        self.min_frontier_distance_from_start = self.get_parameter('min_frontier_distance_from_start').value
         
         # State variables
         self.current_pose = None
@@ -67,9 +76,16 @@ class MazeSolver(Node):
         self.failed_frontiers = []
         self.max_failed_attempts = 3
         
-        # Goal handle and state tracking - CRITICAL FIXES HERE
+        # Random exploration failure tracking
+        self.consecutive_random_failures = 0
+        self.max_random_failures = 3
+        
+        # Desperation mode
+        self.desperation_mode = False
+        
+        # Goal handle and state tracking
         self._current_goal_handle = None
-        self._goal_active = False  # Track if goal is being executed
+        self._goal_active = False
         self._goal_start_time = None
         self._last_goal_status = None
         
@@ -112,10 +128,11 @@ class MazeSolver(Node):
             self.exploration_callback
         )
         
-        self.get_logger().info('Maze Solver Node initialized (FIXED GOAL TRACKING)')
+        self.get_logger().info('Maze Solver Node initialized (STRONG OUTWARD BIAS)')
         self.get_logger().info('=' * 60)
         self.get_logger().info('PHASE 1: Initial 360° rotation for map building')
         self.get_logger().info(f'Duration: {self.initial_rotation_time} seconds')
+        self.get_logger().info(f'Outward exploration weight: {self.outward_weight}')
         self.get_logger().info('=' * 60)
     
     def initial_mapping_callback(self):
@@ -151,6 +168,7 @@ class MazeSolver(Node):
             self.get_logger().info('✓ PHASE 1 COMPLETE: Initial mapping done!')
             self.get_logger().info('=' * 60)
             self.get_logger().info('PHASE 2: Starting frontier-based maze exploration...')
+            self.get_logger().info('Prioritizing areas FAR from start position')
             self.get_logger().info('=' * 60)
     
     def odom_callback(self, msg):
@@ -171,41 +189,116 @@ class MazeSolver(Node):
         """Process updated map from SLAM"""
         self.map_data = np.array(msg.data).reshape((msg.info.height, msg.info.width))
         self.map_info = msg.info
-        
-        if not self.exit_found and self.current_pose is not None and self.initial_mapping_done:
-            self.check_for_exit()
     
     def scan_callback(self, msg):
-        """Process laser scan data for obstacle detection"""
+        """Process laser scan data for obstacle detection and exit detection"""
         self.latest_scan = msg
         self.scan_ranges = np.array(msg.ranges)
         self.scan_ranges[np.isinf(self.scan_ranges)] = msg.range_max
+        
+        # LIDAR-based exit detection (ONLY exit condition)
+        if self.initial_mapping_done and not self.exit_found:
+            self.check_for_exit_lidar()
+    
+    def check_for_exit_lidar(self):
+        """Detect exit using LIDAR - ONLY exit detection method"""
+        if self.latest_scan is None or self.scan_ranges is None:
+            return False
+        
+        if self.current_pose is None or self.start_position is None:
+            return False
+        
+        current_x = self.current_pose.position.x
+        current_y = self.current_pose.position.y
+        distance_from_start = math.sqrt(
+            (current_x - self.start_position[0])**2 + 
+            (current_y - self.start_position[1])**2
+        )
+        
+        if distance_from_start < self.exit_min_distance_from_start:
+            return False
+        
+        half_angle = self.exit_detection_angle / 2.0
+        num_readings = len(self.scan_ranges)
+        indices_per_degree = num_readings / 360.0
+        half_range_indices = int(half_angle * indices_per_degree)
+        
+        clear_readings = 0
+        total_readings = 0
+        
+        for i in range(num_readings - half_range_indices, num_readings):
+            if not np.isnan(self.scan_ranges[i]) and not np.isinf(self.scan_ranges[i]):
+                total_readings += 1
+                if self.scan_ranges[i] >= self.exit_detection_range:
+                    clear_readings += 1
+        
+        for i in range(0, half_range_indices):
+            if not np.isnan(self.scan_ranges[i]) and not np.isinf(self.scan_ranges[i]):
+                total_readings += 1
+                if self.scan_ranges[i] >= self.exit_detection_range:
+                    clear_readings += 1
+        
+        if total_readings == 0:
+            return False
+        
+        clear_percentage = (clear_readings / total_readings) * 100.0
+        
+        if clear_percentage > 80.0:
+            self.exit_found = True
+            
+            orientation = self.current_pose.orientation
+            siny_cosp = 2 * (orientation.w * orientation.z + orientation.x * orientation.y)
+            cosy_cosp = 1 - 2 * (orientation.y * orientation.y + orientation.z * orientation.z)
+            yaw = math.atan2(siny_cosp, cosy_cosp)
+            
+            exit_distance = 3.0
+            self.exit_position = (
+                current_x + exit_distance * math.cos(yaw),
+                current_y + exit_distance * math.sin(yaw)
+            )
+            
+            self.get_logger().info('=' * 60)
+            self.get_logger().info('🎯 EXIT DETECTED VIA LIDAR!')
+            self.get_logger().info(f'Clear path: {clear_percentage:.1f}%')
+            self.get_logger().info(f'Distance from start: {distance_from_start:.2f}m')
+            self.get_logger().info('=' * 60)
+            
+            self.navigate_to_exit()
+            return True
+        
+        return False
     
     def is_goal_in_map_bounds(self, goal_x, goal_y):
-        """Check if a goal position is within the map bounds - ADAPTIVE MARGIN"""
+        """Check if goal is within map bounds"""
         if self.map_info is None:
             return False
         
         mx = int((goal_x - self.map_info.origin.position.x) / self.map_info.resolution)
         my = int((goal_y - self.map_info.origin.position.y) / self.map_info.resolution)
         
-        margin = max(5, int(0.3 / self.map_info.resolution))  # At least 5 cells OR 0.3m
+        # FIXED: Use smaller margin, especially in desperation mode
+        if self.desperation_mode:
+            margin = 1  # Very lenient in desperation
+        else:
+            margin = 2  # Reduced from max(5, int(0.3 / self.map_info.resolution))
     
         is_valid = (margin <= mx < (self.map_info.width - margin) and 
                margin <= my < (self.map_info.height - margin))
-    
+        
         if not is_valid:
             self.get_logger().debug(
-                f'Goal ({goal_x:.2f}, {goal_y:.2f}) -> map({mx}, {my}) '
-                f'is outside bounds with margin {margin} '
-                f'(valid range: {margin} to {self.map_info.width-margin-1}, '
-                f'{margin} to {self.map_info.height-margin-1})'
+                f'Goal ({goal_x:.2f}, {goal_y:.2f}) out of bounds: '
+                f'mx={mx}, my={my}, width={self.map_info.width}, height={self.map_info.height}'
             )
-    
+        
         return is_valid
     
     def is_frontier_failed(self, frontier_x, frontier_y):
-        """Check if this frontier has failed too many times"""
+        """Check if frontier has failed too many times"""
+        # In desperation mode, ignore failed frontier list
+        if self.desperation_mode:
+            return False
+            
         for (fx, fy, count) in self.failed_frontiers:
             distance = math.sqrt((fx - frontier_x)**2 + (fy - frontier_y)**2)
             if distance < 0.3:
@@ -218,79 +311,12 @@ class MazeSolver(Node):
             distance = math.sqrt((fx - frontier_x)**2 + (fy - frontier_y)**2)
             if distance < 0.3:
                 self.failed_frontiers[i] = (fx, fy, count + 1)
-                self.get_logger().warn(
-                    f'Frontier ({fx:.2f}, {fy:.2f}) failed {count + 1}/{self.max_failed_attempts} times'
-                )
                 return
         
         self.failed_frontiers.append((frontier_x, frontier_y, 1))
-        self.get_logger().info(
-            f'Marked frontier ({frontier_x:.2f}, {frontier_y:.2f}) as failed (1/{self.max_failed_attempts})'
-        )
-    
-    def check_for_exit(self):
-        """Detect maze exit"""
-        if self.map_data is None or self.map_info is None:
-            return
-        
-        free_spaces = np.where(self.map_data == 0)
-        
-        if len(free_spaces[0]) == 0:
-            return
-        
-        for i in range(0, len(free_spaces[0]), 10):
-            grid_y = free_spaces[0][i]
-            grid_x = free_spaces[1][i]
-            
-            world_x = grid_x * self.map_info.resolution + self.map_info.origin.position.x
-            world_y = grid_y * self.map_info.resolution + self.map_info.origin.position.y
-            
-            if self.start_position:
-                distance_from_start = math.sqrt(
-                    (world_x - self.start_position[0])**2 + 
-                    (world_y - self.start_position[1])**2
-                )
-                
-                is_near_edge = (
-                    grid_x < 5 or grid_x > self.map_info.width - 5 or
-                    grid_y < 5 or grid_y > self.map_info.height - 5
-                )
-                
-                if distance_from_start > self.exit_threshold and is_near_edge:
-                    if self.is_open_area(grid_x, grid_y):
-                        self.exit_found = True
-                        self.exit_position = (world_x, world_y)
-                        self.get_logger().info('=' * 60)
-                        self.get_logger().info('🎯 EXIT FOUND!')
-                        self.get_logger().info(f'Exit location: ({world_x:.2f}, {world_y:.2f})')
-                        self.get_logger().info(f'Distance from start: {distance_from_start:.2f}m')
-                        self.get_logger().info('=' * 60)
-                        self.navigate_to_exit()
-                        return
-    
-    def is_open_area(self, x, y, radius=3):
-        """Check if area around point is open"""
-        if self.map_data is None:
-            return False
-        
-        h, w = self.map_data.shape
-        count_free = 0
-        count_total = 0
-        
-        for dy in range(-radius, radius+1):
-            for dx in range(-radius, radius+1):
-                ny, nx = y + dy, x + dx
-                if 0 <= ny < h and 0 <= nx < w:
-                    count_total += 1
-                    if self.map_data[ny, nx] == 0:
-                        count_free += 1
-        
-        return count_free / count_total > 0.6 if count_total > 0 else False
     
     def exploration_callback(self):
-        """
-        Main exploration loop - FIXED: Only send new goals when needed
-        """
+        """Main exploration loop"""
         if not self.initial_mapping_done:
             return
         
@@ -300,39 +326,64 @@ class MazeSolver(Node):
         if self.map_data is None or self.current_pose is None:
             return
         
-        # CRITICAL FIX: Don't send new goals if one is actively being executed
         if self._goal_active:
-            # Check if goal has been running too long (timeout after 60 seconds)
             if self._goal_start_time is not None:
                 elapsed = (self.get_clock().now() - self._goal_start_time).nanoseconds / 1e9
                 if elapsed > 60.0:
-                    self.get_logger().warn('⏱️ Goal timeout after 60s - cancelling')
+                    self.get_logger().warn('⏱️ Goal timeout - cancelling')
                     if self._current_goal_handle is not None:
                         self._current_goal_handle.cancel_goal_async()
                     self._goal_active = False
                 else:
-                    # Goal is still active and not timed out - do nothing
                     return
             else:
                 return
         
-        # Find frontiers
         frontiers = self.find_frontiers()
         
         if len(frontiers) == 0:
-            self.get_logger().warn('No frontiers found - random exploration')
+            self.get_logger().warn('No frontiers - random exploration')
             self.random_exploration()
             return
         
-        # Select best valid frontier
         target_frontier = self.select_best_frontier_with_filter(frontiers)
         
         if target_frontier is None:
-            self.get_logger().warn('No valid frontiers - random exploration')
-            self.random_exploration()
-            return
+            self.get_logger().warn('No valid frontiers after filtering')
+            
+            # Log why frontiers were filtered
+            for fx, fy, size in frontiers:
+                failed = self.is_frontier_failed(fx, fy)
+                distance = math.sqrt((fx - self.current_pose.position.x)**2 + 
+                                   (fy - self.current_pose.position.y)**2)
+                in_bounds = self.is_goal_in_map_bounds(fx, fy)
+                
+                if self.start_position:
+                    dist_from_start = math.sqrt(
+                        (fx - self.start_position[0])**2 + 
+                        (fy - self.start_position[1])**2
+                    )
+                else:
+                    dist_from_start = 0
+                
+                self.get_logger().info(
+                    f'  Frontier ({fx:.2f}, {fy:.2f}): '
+                    f'failed={failed}, dist_robot={distance:.2f}m, '
+                    f'dist_start={dist_from_start:.2f}m, in_bounds={in_bounds}'
+                )
+            
+            # Enter desperation mode and try again
+            if not self.desperation_mode:
+                self.get_logger().warn('💀 Entering DESPERATION MODE - ignoring failed frontiers')
+                self.desperation_mode = True
+                target_frontier = self.select_best_frontier_with_filter(frontiers)
+            
+            if target_frontier is None:
+                self.random_exploration()
+                return
         
-        # Check if targeting same frontier repeatedly
+        self.consecutive_random_failures = 0
+        
         if self.last_frontier_target is not None:
             distance_to_last = math.sqrt(
                 (target_frontier[0] - self.last_frontier_target[0])**2 +
@@ -341,13 +392,8 @@ class MazeSolver(Node):
             
             if distance_to_last < 0.3:
                 self.same_frontier_count += 1
-                self.get_logger().warn(
-                    f'⚠️ Same frontier {self.same_frontier_count}/{self.stuck_threshold} times: '
-                    f'({target_frontier[0]:.2f}, {target_frontier[1]:.2f})'
-                )
                 
                 if self.same_frontier_count >= self.stuck_threshold:
-                    self.get_logger().warn('❌ Frontier unreachable! Marking as failed.')
                     self.mark_frontier_failed(target_frontier[0], target_frontier[1])
                     self.same_frontier_count = 0
                     self.last_frontier_target = None
@@ -394,7 +440,7 @@ class MazeSolver(Node):
         return frontier_centroids
     
     def select_best_frontier_with_filter(self, frontiers):
-        """Select best frontier - filters out: too close, failed, outside bounds"""
+        """Select best frontier - HEAVILY prioritize distance from start"""
         if not frontiers or self.current_pose is None:
             return None
         
@@ -410,33 +456,79 @@ class MazeSolver(Node):
             if self.is_frontier_failed(fx, fy):
                 continue
             
-            distance = math.sqrt((fx - current_x)**2 + (fy - current_y)**2)
-            if distance < self.min_frontier_distance:
+            distance_to_robot = math.sqrt((fx - current_x)**2 + (fy - current_y)**2)
+            if distance_to_robot < self.min_frontier_distance:
                 continue
             
             if not self.is_goal_in_map_bounds(fx, fy):
                 continue
             
-            valid_frontiers.append((fx, fy, size, distance))
+            # Filter out frontiers too close to start (unless in desperation mode)
+            if self.start_position and not self.desperation_mode:
+                distance_from_start = math.sqrt(
+                    (fx - self.start_position[0])**2 + 
+                    (fy - self.start_position[1])**2
+                )
+                if distance_from_start < self.min_frontier_distance_from_start:
+                    self.get_logger().debug(
+                        f'Frontier ({fx:.2f}, {fy:.2f}) too close to start ({distance_from_start:.2f}m)'
+                    )
+                    continue
+            
+            valid_frontiers.append((fx, fy, size, distance_to_robot))
         
         if not valid_frontiers:
-            self.get_logger().warn(
-                f'All {len(frontiers)} frontiers filtered out '
-                f'(failed/close/out-of-bounds)'
-            )
             return None
         
-        for fx, fy, size, distance in valid_frontiers:
-            score = size / (distance + 1.0)
+        for fx, fy, size, distance_to_robot in valid_frontiers:
+            if self.start_position is not None:
+                distance_from_start = math.sqrt(
+                    (fx - self.start_position[0])**2 + 
+                    (fy - self.start_position[1])**2
+                )
+            else:
+                distance_from_start = 0.0
+            
+            # AGGRESSIVE OUTWARD SCORING:
+            # 1. Base score from frontier size and proximity to robot
+            base_score = size / (distance_to_robot + 0.5)
+            
+            # 2. EXPONENTIAL boost based on distance from start
+            # This creates a VERY strong preference for far frontiers
+            outward_multiplier = math.pow(1.0 + distance_from_start, self.outward_weight / 5.0)
+            
+            # 3. Additional linear boost
+            outward_bonus = distance_from_start * self.outward_weight
+            
+            # Final score heavily favors distant frontiers
+            score = base_score * outward_multiplier + outward_bonus
             
             if score > best_score:
                 best_score = score
                 best_frontier = (fx, fy)
         
+        if best_frontier and self.start_position:
+            dist_from_start = math.sqrt(
+                (best_frontier[0] - self.start_position[0])**2 + 
+                (best_frontier[1] - self.start_position[1])**2
+            )
+            dist_from_robot = math.sqrt(
+                (best_frontier[0] - current_x)**2 + 
+                (best_frontier[1] - current_y)**2
+            )
+            self.get_logger().info('=' * 60)
+            self.get_logger().info(
+                f'✓ SELECTED FRONTIER: ({best_frontier[0]:.2f}, {best_frontier[1]:.2f})'
+            )
+            self.get_logger().info(f'  Distance from START: {dist_from_start:.2f}m')
+            self.get_logger().info(f'  Distance from ROBOT: {dist_from_robot:.2f}m')
+            self.get_logger().info(f'  Score: {best_score:.2f}')
+            self.get_logger().info('=' * 60)
+        
         return best_frontier
     
     def navigate_to_frontier(self, frontier):
-        """Send navigation goal with proper state tracking"""
+        """Send navigation goal"""
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose.header.frame_id = 'map'
         goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
@@ -445,7 +537,7 @@ class MazeSolver(Node):
         goal_msg.pose.pose.orientation.w = 1.0
         
         self._goal_start_time = self.get_clock().now()
-        self._goal_active = True  # Mark goal as active immediately
+        self._goal_active = True
         
         self.get_logger().info(f'→ Navigating to frontier at ({frontier[0]:.2f}, {frontier[1]:.2f})')
         
@@ -454,71 +546,92 @@ class MazeSolver(Node):
         future.add_done_callback(self._goal_response_callback)
     
     def feedback_callback(self, feedback_msg):
-        """Receive feedback from navigation"""
-        pass  # Can add progress tracking here if needed
+        pass
     
     def _goal_response_callback(self, future):
-        """Handle goal acceptance/rejection"""
         goal_handle = future.result()
         
         if not goal_handle.accepted:
             self.get_logger().warn('Goal rejected!')
             self._current_goal_handle = None
-            self._goal_active = False  # Goal not active if rejected
+            self._goal_active = False
             return
         
-        self.get_logger().info('✓ Goal accepted, navigating...')
+        self.get_logger().info('✓ Goal accepted')
         self._current_goal_handle = goal_handle
         
-        # Get result when done
         result_future = goal_handle.get_result_async()
         result_future.add_done_callback(self._goal_result_callback)
     
     def _goal_result_callback(self, future):
-        """Handle goal completion"""
         result = future.result()
         status = result.status
         
-        self._goal_active = False  # Goal is no longer active
+        self._goal_active = False
         self._current_goal_handle = None
         
         if status == GoalStatus.STATUS_SUCCEEDED:
-            self.get_logger().info('✓ Goal reached successfully!')
-            self.same_frontier_count = 0  # Reset counter on success
+            self.get_logger().info('✓ Goal reached!')
+            self.same_frontier_count = 0
+            self.consecutive_random_failures = 0
+            self.desperation_mode = False  # Reset desperation
         elif status == GoalStatus.STATUS_ABORTED:
-            self.get_logger().warn('⚠️ Goal aborted by Nav2')
+            self.get_logger().warn('⚠️ Goal aborted')
         elif status == GoalStatus.STATUS_CANCELED:
             self.get_logger().warn('⚠️ Goal cancelled')
-        else:
-            self.get_logger().warn(f'⚠️ Goal ended with status: {status}')
     
     def random_exploration(self):
-        """Move to random nearby point - ADAPTIVE for different maze sizes"""
-        if self.current_pose is None or self.map_info is None:
+        """Random exploration - also biased outward"""
+        if self.current_pose is None or self.map_info is None or self.map_data is None:
             return
         
-        max_attempts = 30
-        for attempt in range(max_attempts):
-            angle = random.uniform(0, 2 * math.pi)
-            
-            min_dimension = min(self.map_info.width, self.map_info.height) * self.map_info.resolution
-            
-            if min_dimension < 2.0:
-                distance = random.uniform(0.2, 0.6)
+        max_attempts = 40
+        
+        # Adaptive margin based on desperation
+        if self.desperation_mode:
+            margin = 1  # FIXED: Even more aggressive
+            self.get_logger().warn(f'🔥 DESPERATION MODE: using margin={margin}')
+        elif self.consecutive_random_failures >= 2:
+            margin = 3  # FIXED: Reduced from 5
+            self.get_logger().warn(f'Using reduced margin={margin}')
+        else:
+            margin = 5  # FIXED: Reduced from 8
+        
+        # Calculate direction away from start for bias
+        if self.start_position:
+            away_from_start_x = self.current_pose.position.x - self.start_position[0]
+            away_from_start_y = self.current_pose.position.y - self.start_position[1]
+            dist = math.sqrt(away_from_start_x**2 + away_from_start_y**2)
+            if dist > 0.1:
+                away_from_start_x /= dist
+                away_from_start_y /= dist
             else:
-                distance = random.uniform(0.4, 1.2)
+                away_from_start_x = 0
+                away_from_start_y = 0
+        else:
+            away_from_start_x = 0
+            away_from_start_y = 0
+        
+        for attempt in range(max_attempts):
+            # Bias angle selection toward direction away from start
+            if random.random() < 0.7 and dist > 0.1:  # 70% of time, prefer outward direction
+                # Random angle around the "away from start" direction (±90°)
+                away_angle = math.atan2(away_from_start_y, away_from_start_x)
+                angle = away_angle + random.uniform(-math.pi/2, math.pi/2)
+            else:
+                angle = random.uniform(0, 2 * math.pi)
+            
+            # FIXED: Increased minimum distance from 0.3 to 0.5, max from 1.2 to 1.5
+            distance = random.uniform(0.5, 1.5)
             
             goal_x = self.current_pose.position.x + distance * math.cos(angle)
             goal_y = self.current_pose.position.y + distance * math.sin(angle)
             
-            if not self.is_goal_in_map_bounds(goal_x, goal_y):
-                continue
-            
             mx = int((goal_x - self.map_info.origin.position.x) / self.map_info.resolution)
             my = int((goal_y - self.map_info.origin.position.y) / self.map_info.resolution)
             
-            if not (0 <= mx < self.map_info.width and 
-                    0 <= my < self.map_info.height):
+            if not (margin <= mx < (self.map_info.width - margin) and 
+                    margin <= my < (self.map_info.height - margin)):
                 continue
             
             if self.map_data[my, mx] != 0:
@@ -539,12 +652,22 @@ class MazeSolver(Node):
                         if self.map_data[check_y, check_x] == 0:
                             free_space_count += 1
             
-            if total_checks > 0 and (free_space_count / total_checks) < 0.4:
+            threshold = 0.4 if self.desperation_mode else 0.6
+            if total_checks > 0 and (free_space_count / total_checks) < threshold:
                 continue
             
+            # Calculate how far this random goal is from start
+            if self.start_position:
+                goal_dist_from_start = math.sqrt(
+                    (goal_x - self.start_position[0])**2 + 
+                    (goal_y - self.start_position[1])**2
+                )
+            else:
+                goal_dist_from_start = 0
+            
             self.get_logger().info(
-                f'🔀 Random exploration to ({goal_x:.2f}, {goal_y:.2f}) '
-                f'[attempt {attempt+1}, distance {distance:.2f}m]'
+                f'🔀 Random to ({goal_x:.2f}, {goal_y:.2f}) '
+                f'[dist from start: {goal_dist_from_start:.2f}m, dist from robot: {distance:.2f}m, attempt {attempt+1}]'
             )
             
             goal_msg = NavigateToPose.Goal()
@@ -560,9 +683,22 @@ class MazeSolver(Node):
             self.nav_client.wait_for_server()
             future = self.nav_client.send_goal_async(goal_msg, feedback_callback=self.feedback_callback)
             future.add_done_callback(self._goal_response_callback)
+            
+            self.consecutive_random_failures = 0
             return
         
-        self.get_logger().error(f'❌ Failed to find valid random goal after {max_attempts} attempts!')
+        self.consecutive_random_failures += 1
+        self.get_logger().error(
+            f'❌ No valid random goal after {max_attempts} attempts! '
+            f'({self.consecutive_random_failures}/{self.max_random_failures})'
+        )
+        
+        if self.consecutive_random_failures >= self.max_random_failures:
+            if not self.desperation_mode:
+                self.get_logger().warn('💀 Entering DESPERATION MODE - clearing failed frontiers')
+                self.desperation_mode = True
+                self.failed_frontiers = []
+                self.consecutive_random_failures = 0
     
     def navigate_to_exit(self):
         """Navigate to exit"""
@@ -584,15 +720,18 @@ class MazeSolver(Node):
         self.get_logger().info(f'Exit: ({self.exit_position[0]:.2f}, {self.exit_position[1]:.2f})')
         self.get_logger().info('=' * 60)
         
+        self._goal_active = True
+        self._goal_start_time = self.get_clock().now()
+        
         self.nav_client.wait_for_server()
         send_goal_future = self.nav_client.send_goal_async(goal_msg)
         send_goal_future.add_done_callback(self.goal_response_callback)
     
     def goal_response_callback(self, future):
-        """Handle goal response for exit navigation"""
         goal_handle = future.result()
         if not goal_handle.accepted:
             self.get_logger().error('❌ Goal rejected')
+            self._goal_active = False
             return
         
         self.get_logger().info('✓ Goal accepted')
@@ -600,7 +739,7 @@ class MazeSolver(Node):
         result_future.add_done_callback(self.goal_result_callback)
     
     def goal_result_callback(self, future):
-        """Handle goal result for exit navigation"""
+        self._goal_active = False
         self.get_logger().info('=' * 60)
         self.get_logger().info('🎉 MAZE SOLVED! 🎉')
         self.get_logger().info('=' * 60)
