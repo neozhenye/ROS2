@@ -176,15 +176,5 @@
       </link>
     </model>
 
-    <!-- =========================
-         TURTLEBOT3 BURGER SPAWN
-         ========================= -->
-    <model name="turtlebot3_burger">
-      <include>
-        <uri>file:///opt/ros/humble/share/turtlebot3_gazebo/models/turtlebot3_burger</uri>
-      </include>
-      <pose>-0.25 0.25 0.1 0 0 0</pose>
-    </model>
-
   </world>
 </sdf>
