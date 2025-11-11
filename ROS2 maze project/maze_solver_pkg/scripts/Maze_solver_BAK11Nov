@@ -1,0 +1,570 @@
+#!/usr/bin/env python3
+
+"""
+Maze Solver Algorithm
+==============================================
+Creator : Neo Zhen YE
+Admin ID : 2402759 
+
+what code does in genral:
+1. Continuously seeks map edges/boundaries
+3. Exit detection: ≥60° opening, all readings ≥3.5m clear
+4. When exit found, send ONE final goal 0.4m from exit and complete mission
+"""
+
+import rclpy
+from rclpy.node import Node
+from rclpy.action import ActionClient
+from nav2_msgs.action import NavigateToPose
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry, OccupancyGrid
+from sensor_msgs.msg import LaserScan
+from action_msgs.msg import GoalStatus
+import numpy as np
+import math
+
+class MazeSolver(Node):
+    def __init__(self):
+        super().__init__('maze_solver')
+        
+        #parameters
+        
+        #Initial mapping
+        self.declare_parameter('initial_rotation_time', 18.0)
+        
+        #Edge seeking
+        self.declare_parameter('exploration_interval', 6.0)
+        self.declare_parameter('goal_timeout', 25.0)
+        self.declare_parameter('map_ready_threshold', 100)
+        self.declare_parameter('min_goal_distance', 0.3)
+        self.declare_parameter('edge_search_directions', 12)
+        self.declare_parameter('edge_goal_distance', 1.5)
+        
+        #exit detection
+        self.declare_parameter('exit_min_depth', 3.5)  #depth needed for a goal
+        self.declare_parameter('exit_min_angle', 60.0)  #how many degrees of depth clearance : 60deg
+        
+        #exit approach
+        self.declare_parameter('exit_approach_distance', 0.4)  #stop 0.4m before exit
+        
+        #load parameters
+        self.initial_rotation_time = self.get_parameter('initial_rotation_time').value
+        self.exploration_interval = self.get_parameter('exploration_interval').value
+        self.goal_timeout = self.get_parameter('goal_timeout').value
+        self.map_ready_threshold = self.get_parameter('map_ready_threshold').value
+        self.min_goal_distance = self.get_parameter('min_goal_distance').value
+        self.edge_search_directions = self.get_parameter('edge_search_directions').value
+        self.edge_goal_distance = self.get_parameter('edge_goal_distance').value
+        
+        self.exit_min_depth = self.get_parameter('exit_min_depth').value
+        self.exit_min_angle = self.get_parameter('exit_min_angle').value
+        self.exit_approach_distance = self.get_parameter('exit_approach_distance').value
+        
+        #state variable
+        
+        #robot state
+        self.current_pose = None
+        self.start_position = None
+        
+        #sensor data
+        self.latestScan = None
+        self.scanRanges = None
+        self.mapData = None
+        self.mapInfo = None
+        self.mapReady = False
+        
+        #phase tracking
+        self.initial_mapping_done = False
+        self.initial_mapping_start_time = None
+        self.exit_found = False
+        self.exit_approach_goal_sent = False
+        self.exit_direction_rad = None  # Only need radians for calculation
+        self.exit_width = None
+        self.exit_depth = None
+        self.maze_completed = False
+        
+        #exploration state
+        self.current_direction_index = 0
+        self.exploration_directions = [i * (360.0 / self.edge_search_directions) 
+                                      for i in range(self.edge_search_directions)]
+        self.failed_goal_attempts = 0
+        
+        #goal tracking
+        self._goal_active = False
+        self._goal_start_time = None
+        self._current_goal_handle = None
+        self.last_goal_position = None
+        
+        #publishers, subscriber, and action client
+       
+        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.odom_sub = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
+        self.scan_sub = self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
+        self.map_sub = self.create_subscription(OccupancyGrid, '/map', self.map_callback, 10)
+        self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        
+        #timers
+        
+        self.initial_mapping_timer = self.create_timer(0.1, self.initial_mapping_callback)
+        self.exploration_timer = self.create_timer(self.exploration_interval, self.exploration_callback)
+        self.exit_check_timer = self.create_timer(0.5, self.check_for_exit)
+        
+        #startup msg
+        
+        self.get_logger().info('=' * 80)
+        self.get_logger().info('MAZE SOLVER - STRICT EXIT DETECTION VERSION')
+        self.get_logger().info('Strategy: Edge-seeking with strict exit detection')
+        self.get_logger().info('=' * 80)
+
+    #callbacks
+    
+    def map_callback(self, msg):
+        """Process incoming map from SLAM"""
+        self.mapData = np.array(msg.data).reshape((msg.info.height, msg.info.width))
+        self.mapInfo = msg.info
+        
+        free_cells = np.sum(self.mapData == 0)
+        unknown_cells = np.sum(self.mapData == -1)
+        
+        was_ready = self.mapReady
+        self.mapReady = free_cells >= self.map_ready_threshold
+        
+        if self.mapReady and not was_ready:
+            self.get_logger().info(f'Map ready! Free: {free_cells} | Unknown: {unknown_cells}')
+    
+    def odom_callback(self, msg):
+        """Track robot position"""
+        self.current_pose = msg.pose.pose
+        
+        if self.start_position is None:
+            self.start_position = (
+                msg.pose.pose.position.x,
+                msg.pose.pose.position.y
+            )
+            self.get_logger().info(f'Start: ({self.start_position[0]:.3f}, {self.start_position[1]:.3f})')
+    
+    def scan_callback(self, msg):
+        """Process laser scan data"""
+        self.latestScan = msg
+        self.scanRanges = np.array(msg.ranges)
+        self.scanRanges[np.isinf(self.scanRanges)] = msg.range_max
+        self.scanRanges[np.isnan(self.scanRanges)] = 0.0
+    
+    # initial mapping
+    
+    def initial_mapping_callback(self):
+        """rotate in place to build initial map"""
+        if self.initial_mapping_done:
+            self.initial_mapping_timer.cancel()
+            return
+        
+        if self.initial_mapping_start_time is None:
+            self.initial_mapping_start_time = self.get_clock().now()
+            self.get_logger().info(f'PHASE 1: Initial mapping ({self.initial_rotation_time}s)...')
+        
+        elapsed = (self.get_clock().now() - self.initial_mapping_start_time).nanoseconds / 1e9
+        
+        if elapsed < self.initial_rotation_time:
+            twist = Twist()
+            twist.angular.z = 0.3
+            self.cmd_vel_pub.publish(twist)
+        else:
+            twist = Twist()
+            self.cmd_vel_pub.publish(twist)
+            
+            self.initial_mapping_done = True
+            self.get_logger().info('PHASE 1 Complete! Starting edge exploration...')
+
+    #exploration with edge seeking
+    
+    def exploration_callback(self):
+        """continuously seek map edges"""
+        
+        if not self.initial_mapping_done or not self.mapReady:
+            return
+        
+        if self.exit_found or self.maze_completed:
+            return
+        
+        if self.current_pose is None or self.start_position is None:
+            return
+        
+        if self._goal_active:
+            if self._goal_start_time is not None:
+                elapsed = (self.get_clock().now() - self._goal_start_time).nanoseconds / 1e9
+                if elapsed > self.goal_timeout:
+                    self.get_logger().warn(f'⏱️  Goal timeout - cancelling')
+                    if self._current_goal_handle is not None:
+                        self._current_goal_handle.cancel_goal_async()
+                    self._goal_active = False
+                else:
+                    return
+            else:
+                return
+        
+        target = self.find_edge_goal()
+        
+        if target is None:
+            self.failed_goal_attempts += 1
+            self.get_logger().warn(f'No valid edge goals found (attempt {self.failed_goal_attempts})')
+            
+            if self.failed_goal_attempts >= 3:
+                target = self.generate_random_goal()
+                if target is not None:
+                    self.get_logger().info('Using random exploration goal')
+                    self.failed_goal_attempts = 0
+                else:
+                    return
+            else:
+                return
+        else:
+            self.failed_goal_attempts = 0
+        
+        self.navigate_to_target(target)
+    
+    def find_edge_goal(self):
+        """find a goal position heading toward map edges"""
+        
+        attempts = 0
+        max_attempts = self.edge_search_directions * 2
+        
+        while attempts < max_attempts:
+            angle_deg = self.exploration_directions[self.current_direction_index]
+            self.current_direction_index = (self.current_direction_index + 1) % len(self.exploration_directions)
+            attempts += 1
+            
+            angle_rad = math.radians(angle_deg)
+            distance = self.edge_goal_distance
+            
+            for dist_attempt in range(10):
+                test_distance = distance - (dist_attempt * 0.15)
+                if test_distance < self.min_goal_distance:
+                    break
+                
+                target_x = self.current_pose.position.x + test_distance * math.cos(angle_rad)
+                target_y = self.current_pose.position.y + test_distance * math.sin(angle_rad)
+                
+                if self.is_valid_edge_goal(target_x, target_y):
+                    dist_from_robot = math.sqrt(
+                        (target_x - self.current_pose.position.x)**2 +
+                        (target_y - self.current_pose.position.y)**2
+                    )
+                    
+                    if dist_from_robot >= self.min_goal_distance:
+                        if self.last_goal_position is not None:
+                            dist_from_last = math.sqrt(
+                                (target_x - self.last_goal_position[0])**2 +
+                                (target_y - self.last_goal_position[1])**2
+                            )
+                            if dist_from_last < 0.25:
+                                continue
+                        
+                        return (target_x, target_y)
+        
+        return None
+    
+    def is_valid_edge_goal(self, x, y):
+        """check if position is valid - lenient to embrace unknown space"""
+        if not self.mapReady or self.mapInfo is None or self.mapData is None:
+            return False
+        
+        mx = int((x - self.mapInfo.origin.position.x) / self.mapInfo.resolution)
+        my = int((y - self.mapInfo.origin.position.y) / self.mapInfo.resolution)
+        
+        margin = 1
+        if not (margin <= mx < (self.mapInfo.width - margin) and margin <= my < (self.mapInfo.height - margin)):
+            return False
+        
+        cell_value = self.mapData[my, mx]
+        if cell_value > 70:
+            return False
+        
+        check_radius = 1
+        occupied_count = 0
+        total_checked = 0
+        
+        for dy in range(-check_radius, check_radius + 1):
+            for dx in range(-check_radius, check_radius + 1):
+                cx, cy = mx + dx, my + dy
+                if (0 <= cx < self.mapInfo.width and 0 <= cy < self.mapInfo.height):
+                    total_checked += 1
+                    if self.mapData[cy, cx] > 70:
+                        occupied_count += 1
+        
+        if total_checked > 0 and (occupied_count / total_checked) > 0.4:
+            return False
+        
+        return True
+    
+    def generate_random_goal(self):
+        """generate a random goal for exploration fallback"""
+        if self.current_pose is None:
+            return None
+        
+        for _ in range(10):
+            angle_rad = np.random.uniform(0, 2 * math.pi)
+            distance = np.random.uniform(0.5, 1.2)
+            
+            target_x = self.current_pose.position.x + distance * math.cos(angle_rad)
+            target_y = self.current_pose.position.y + distance * math.sin(angle_rad)
+            
+            if self.is_valid_edge_goal(target_x, target_y):
+                return (target_x, target_y)
+        
+        return None
+    
+    def navigate_to_target(self, target):
+        """Send navigation goal to Nav2"""
+        target_x, target_y = target
+        
+        self.get_logger().info(
+            f'Sending goal to position: ({target_x:.2f}, {target_y:.2f})'
+        )
+        
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose.header.frame_id = 'map'
+        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.pose.pose.position.x = target_x
+        goal_msg.pose.pose.position.y = target_y
+        goal_msg.pose.pose.position.z = 0.0
+        goal_msg.pose.pose.orientation.w = 1.0  # Default orientation
+        
+        self.last_goal_position = (target_x, target_y)
+        self._goal_active = True
+        self._goal_start_time = self.get_clock().now()
+        
+        self.nav_client.wait_for_server()
+        future = self.nav_client.send_goal_async(goal_msg)
+        future.add_done_callback(self._goal_response_callback)
+
+    # exit detection and final goal
+    
+    def check_for_exit(self):
+        """Detect exits and send ONE final goal close to exit"""
+        
+        if not self.initial_mapping_done or not self.mapReady or self.exit_found or self.maze_completed:
+            return
+        
+        if self.latestScan is None or self.current_pose is None or self.start_position is None:
+            return
+        
+        #strict exit detection: find wide opening with long clear depth
+        num_readings = len(self.scanRanges)
+        angle_increment = self.latestScan.angle_increment
+        
+        best_exit = None
+        best_score = 0
+        
+        #scan for wide, clear openings
+        i = 0
+        while i < num_readings:
+            #skip readings that don't meet minimum depth
+            if self.scanRanges[i] < self.exit_min_depth:
+                i += 1
+                continue
+
+            opening_start = i
+            opening_readings = []
+            
+            #collect all consecutive readings >= exit_min_depth
+            while i < num_readings and self.scanRanges[i] >= self.exit_min_depth:
+                opening_readings.append(self.scanRanges[i])
+                i += 1
+            
+            opening_end = i - 1
+            
+            if len(opening_readings) < 5:  # Need sufficient readings
+                continue
+            
+            # Calculate opening angle in degrees
+            opening_angle_rad = (opening_end - opening_start) * angle_increment
+            opening_angle_deg = math.degrees(opening_angle_rad)
+            
+            #exit criteria:
+            #opening must span at least exit_min_angle degrees
+            #all readings in the opening must be >= exit_min_depth
+            
+            if opening_angle_deg >= self.exit_min_angle:
+                #calculate metrics
+                min_depth = np.min(opening_readings)
+                avg_depth = np.mean(opening_readings)
+                max_depth = np.max(opening_readings)
+                
+                #prefer wider openings with deeper readings
+                score = opening_angle_deg * 0.6 + avg_depth * 0.4
+                
+                if score > best_score:
+                    best_score = score
+                    center_idx = (opening_start + opening_end) // 2
+                    center_angle_rad = self.latestScan.angle_min + center_idx * angle_increment
+                    best_exit = {
+                        'direction_rad': center_angle_rad,
+                        'angle_span': opening_angle_deg,
+                        'min_depth': min_depth,
+                        'avg_depth': avg_depth,
+                        'max_depth': max_depth,
+                        'num_readings': len(opening_readings)
+                    }
+    
+        #exit found! Send one final goal close to exit
+        if best_exit is not None:
+            self.exit_found = True
+            self.exit_direction_rad = best_exit['direction_rad']
+            self.exit_width = best_exit['angle_span']
+            self.exit_depth = best_exit['avg_depth']
+            
+            self.get_logger().info('EXIT DETECTED (STRICT CRITERIA MET)!')
+            self.get_logger().info(f'Opening angle: {best_exit["angle_span"]:.1f}° (≥{self.exit_min_angle}°)')
+            self.get_logger().info(f'Depth range: min={best_exit["min_depth"]:.2f}m, avg={best_exit["avg_depth"]:.2f}m, max={best_exit["max_depth"]:.2f}m')
+            self.get_logger().info(f'Readings in opening: {best_exit["num_readings"]}')
+            self.get_logger().info(f' All readings ≥ {self.exit_min_depth}m - CONFIRMED EXIT!')
+            self.get_logger().info('Sending ONE final goal 0.4m from exit...')
+            
+            # Cancel any ongoing exploration goal
+            if self._current_goal_handle is not None:
+                self._current_goal_handle.cancel_goal_async()
+                self._goal_active = False
+            
+            # Stop exploration timers - this is the FINAL goal
+            self.exploration_timer.cancel()
+            self.exit_check_timer.cancel()
+            
+            # Send ONE final goal close to the exit
+            self.send_final_exit_goal()
+
+    def send_final_exit_goal(self):
+        """Send one final goal 0.4m from the exit"""
+        if self.exit_direction_rad is None or self.current_pose is None:
+            return
+        
+        # Position at 0.4m towards the exit (relative to robot frame)
+        approach_x = self.current_pose.position.x + self.exit_approach_distance * math.cos(self.exit_direction_rad)
+        approach_y = self.current_pose.position.y + self.exit_approach_distance * math.sin(self.exit_direction_rad)
+        
+        self.get_logger().info('=' * 80)
+        self.get_logger().info('FINAL GOAL: Moving to 0.4m from exit')
+        self.get_logger().info(f'Target position: ({approach_x:.2f}, {approach_y:.2f})')
+        self.get_logger().info(f'Distance: {self.exit_approach_distance}m from exit')
+        self.get_logger().info('This is the LAST goal - mission completes after this!')
+        self.get_logger().info('=' * 80)
+        
+        # Send Nav2 goal to approach position
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose.header.frame_id = 'map'
+        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.pose.pose.position.x = approach_x
+        goal_msg.pose.pose.position.y = approach_y
+        goal_msg.pose.pose.position.z = 0.0
+        goal_msg.pose.pose.orientation.w = 1.0  # Default orientation
+        
+        self._goal_active = True
+        self._goal_start_time = self.get_clock().now()
+        self.exit_approach_goal_sent = True
+        
+        self.nav_client.wait_for_server()
+        future = self.nav_client.send_goal_async(goal_msg)
+        future.add_done_callback(self.final_goal_response_callback)
+
+    def final_goal_response_callback(self, future):
+        """Handle final goal acceptance"""
+        goal_handle = future.result()
+        
+        if not goal_handle.accepted:
+            self.get_logger().error('Final goal rejected! Mission complete anyway.')
+            self.complete_mission()
+            return
+        
+        self.get_logger().info('Final goal accepted, navigating to exit...')
+        self._current_goal_handle = goal_handle
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self.final_goal_result_callback)
+
+    def final_goal_result_callback(self, future):
+        """Handle final goal completion - ALWAYS complete mission"""
+        result = future.result()
+        status = result.status
+        
+        self._goal_active = False
+        self._current_goal_handle = None
+        
+        # ALWAYS complete mission regardless of goal success/failure
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().info('Final goal reached successfully!')
+        else:
+            self.get_logger().warn('Final goal failed, but mission complete (exit was found)')
+        
+        self.complete_mission()
+
+    def complete_mission(self):
+        """Final mission completion routine"""
+        self.maze_completed = True
+        
+        # Stop the robot
+        twist = Twist()
+        self.cmd_vel_pub.publish(twist)
+        
+        # Get final position
+        x = self.current_pose.position.x
+        y = self.current_pose.position.y
+        distance_from_start = math.sqrt(
+            (x - self.start_position[0])**2 + 
+            (y - self.start_position[1])**2
+        )
+        
+        self.get_logger().info('=' * 40)
+        self.get_logger().info(' MISSION COMPLETE! EXIT FOUND! ')
+        self.get_logger().info(f'Final position: ({x:.3f}, {y:.3f})')
+        self.get_logger().info(f'Distance from start: {distance_from_start:.3f}m')
+        if self.exit_width is not None and self.exit_depth is not None:
+            self.get_logger().info(f'Exit detected: {self.exit_width:.1f}° opening, {self.exit_depth:.2f}m deep')
+        self.get_logger().info('Robot safely stopped!')
+        self.get_logger().info('=' * 40)
+    
+    # goal callbacks
+    
+    def _goal_response_callback(self, future):
+        """Handle goal acceptance/rejection"""
+        goal_handle = future.result()
+        
+        if not goal_handle.accepted:
+            self.get_logger().warn('Goal rejected')
+            self._goal_active = False
+            self._current_goal_handle = None
+            return
+        
+        self._current_goal_handle = goal_handle
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self._goal_result_callback)
+    
+    def _goal_result_callback(self, future):
+        """Handle goal completion"""
+        result = future.result()
+        status = result.status
+        
+        self._goal_active = False
+        self._current_goal_handle = None
+        
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().info('Goal reached')
+        else:
+            self.get_logger().warn('Goal failed')
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    maze_solver = MazeSolver()
+    
+    try:
+        rclpy.spin(maze_solver)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Final cleanup
+        twist = Twist()
+        maze_solver.cmd_vel_pub.publish(twist)
+        maze_solver.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
