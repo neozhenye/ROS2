@@ -1,0 +1,89 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+
+Visualization Manager:
+  Displays:
+    # Grid
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Plane Cell Count: 20
+      Color: 160; 160; 164
+      
+    # Map from SLAM
+    - Class: rviz_default_plugins/Map
+      Name: SLAM Map
+      Topic:
+        Depth: 1
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /map
+      Alpha: 0.7
+      Color Scheme: map
+      
+    # Laser Scan
+    - Class: rviz_default_plugins/LaserScan
+      Name: LaserScan
+      Topic:
+        Depth: 1
+        Value: /scan
+      Size (m): 0.05
+      Style: Flat Squares
+      Color: 255; 255; 255
+      
+    # Robot Model
+    - Class: rviz_default_plugins/RobotModel
+      Name: RobotModel
+      Description Topic:
+        Value: /robot_description
+      Visual Enabled: true
+      
+    # TF Frames
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Show Names: false
+      Show Axes: true
+      
+    # Global Path (green)
+    - Class: rviz_default_plugins/Path
+      Name: Global Path
+      Topic:
+        Value: /plan
+      Color: 25; 255; 0
+      Alpha: 1.0
+      Line Width: 0.03
+      
+    # Local Costmap
+    - Class: rviz_default_plugins/Map
+      Name: Local Costmap
+      Topic:
+        Value: /local_costmap/costmap
+      Alpha: 0.5
+      Color Scheme: costmap
+      
+    # Global Costmap
+    - Class: rviz_default_plugins/Map
+      Name: Global Costmap
+      Topic:
+        Value: /global_costmap/costmap
+      Alpha: 0.3
+      Color Scheme: costmap
+      Draw Behind: true
+
+  Global Options:
+    Fixed Frame: map
+    Background Color: 48; 48; 48
+
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 8.0
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Pitch: 1.57
+      Yaw: 0
